@@ -37,13 +37,15 @@ from src.risk_barrier  import HFTRiskGuard
 from src.executor      import HFTExecutionEngine
 
 # ── Daemon Config ────────────────────────────────────────────────────────────
-LIVE_MODE        = False          # Paper trading only — flip to True for live
-SYMBOL           = "BTCUSDT"
-INITIAL_CAPITAL  = 100_000.0     # USD paper capital
-TICK_INTERVAL_MS = 10            # Simulated tick frequency (10ms = 100 ticks/s)
-MAX_RUNTIME_SEC  = 30            # Demo run duration (0 = infinite)
-OBI_THRESHOLD    = 0.70          # Signal sensitivity: higher = less trades
-LOG_EVERY_N      = 20            # Print stats every N ticks
+CONFIG = {
+    "mode": os.environ.get("HFT_MODE", "paper"),
+    "symbol": os.environ.get("HFT_SYMBOL", "BTCUSDT"),
+    "initial_capital": float(os.environ.get("HFT_CAPITAL", "50.0")),
+    "tick_interval_ms": int(os.environ.get("HFT_TICK_MS", "500")),
+    "obi_threshold": float(os.environ.get("HFT_OBI", "0.70")),
+    "max_runtime_sec": int(os.environ.get("HFT_RUNTIME", "0")),
+    "log_every_n_ticks": 50,
+}
 
 # ── Exchange Depth Snapshot (simulated live top-of-book) ─────────────────────
 def get_simulated_depths(mid_price: float) -> dict:
@@ -73,6 +75,7 @@ class Portfolio:
         self.trades_log = []
         self.tick_count = 0
         self.pnl_series = []
+        self.daily_pnl  = 0.0
 
     def value(self, price: float) -> float:
         return self.capital + (self.position * price)
@@ -84,45 +87,60 @@ class Portfolio:
         })
 
     def print_summary(self, price: float):
+        initial_cap = CONFIG["initial_capital"]
         total_val   = self.value(price)
-        net_pnl     = total_val - INITIAL_CAPITAL
-        pnl_pct     = (net_pnl / INITIAL_CAPITAL) * 100
+        net_pnl     = total_val - initial_cap
+        pnl_pct     = (net_pnl / initial_cap) * 100
         num_trades  = len(self.trades_log)
         latencies   = [t["latency_us"] for t in self.trades_log] or [0]
         avg_lat     = statistics.mean(latencies)
 
-        print("\n" + "═" * 62)
-        print("   📊  HFT SOVEREIGN DAEMON — SESSION REPORT")
-        print("═" * 62)
-        print(f"   Symbol          : {SYMBOL}")
+        print("\n" + "=" * 62)
+        print("   [HFT SOVEREIGN DAEMON] — SESSION REPORT")
+        print("=" * 62)
+        print(f"   Symbol          : {CONFIG['symbol']}")
         print(f"   Ticks Processed : {self.tick_count:,}")
         print(f"   Trades Executed : {num_trades}")
-        print(f"   ─────────────────────────────────────────")
-        print(f"   Starting Capital: ${INITIAL_CAPITAL:,.2f}")
+        print(f"   -----------------------------------------")
+        print(f"   Starting Capital: ${initial_cap:,.2f}")
         print(f"   Final Value     : ${total_val:,.2f}")
         print(f"   Net PnL         : ${net_pnl:+,.2f} ({pnl_pct:+.2f}%)")
-        print(f"   Avg Exec Latency: {avg_lat:.1f} µs")
-        print(f"   Mode            : {'🔴 LIVE' if LIVE_MODE else '🟡 PAPER'}")
-        print("═" * 62 + "\n")
+        print(f"   Daily PnL       : ${self.daily_pnl:+,.2f}")
+        print(f"   Avg Exec Latency: {avg_lat:.1f} us")
+        print(f"   Mode            : {CONFIG['mode'].upper()}")
+        print("=" * 62 + "\n")
 
+
+import requests
+import signal
 
 # ── Unified HFT Daemon ───────────────────────────────────────────────────────
 class HFTSovereignDaemon:
     def __init__(self):
-        print("\n" + "═" * 62)
-        print("   🚀  HFT SOVEREIGN TRADING DAEMON  STARTING UP")
-        print("═" * 62)
+        print("\n" + "=" * 62)
+        print("   [HFT SOVEREIGN TRADING DAEMON] STARTING UP")
+        print("=" * 62)
 
         # Initialise all subsystems
-        self.alpha   = HFTAlphaSignals(obi_threshold=OBI_THRESHOLD)
+        self.alpha   = HFTAlphaSignals(obi_threshold=CONFIG["obi_threshold"])
         self.risk    = HFTRiskGuard(max_position=2.0, max_drawdown=0.03,
                                     max_trades_per_sec=10)
         self.engine  = HFTExecutionEngine(latency_buffer_ms=0.15)
-        self.port    = Portfolio(INITIAL_CAPITAL)
+        self.port    = Portfolio(CONFIG["initial_capital"])
         self.running = False
 
-        # Fake mid-price starting point (Geometric Brownian Motion)
-        self._price  = 58_000.0
+        # Start with an initial price
+        self._price  = self._fetch_real_price() or 58_000.0
+
+    def _fetch_real_price(self) -> float:
+        try:
+            url = f"https://api.binance.com/api/v3/ticker/price?symbol={CONFIG['symbol']}"
+            resp = requests.get(url, timeout=2)
+            resp.raise_for_status()
+            data = resp.json()
+            return float(data["price"])
+        except Exception:
+            return getattr(self, "_price", 58_000.0)
 
     # ── Simulated tick generator ─────────────────────────────────────────────
     def _next_tick(self):
@@ -145,6 +163,9 @@ class HFTSovereignDaemon:
     # ── Hot path: single tick processing ────────────────────────────────────
     def _process_tick(self):
         self.port.tick_count += 1
+        if self.port.tick_count % 100 == 0:
+            self._price = self._fetch_real_price()
+
         price       = self._price
         equity      = self.port.value(price)
         current_pos = self.port.position
@@ -173,21 +194,21 @@ class HFTSovereignDaemon:
         # ⑤ Risk Guard pre-flight check
         safe, reason, risk_lat_us = self.risk.check_safety(signal, order_qty)
         if not safe:
-            if self.port.tick_count % LOG_EVERY_N == 0:
-                print(f"[RISK] ⛔ Blocked: {reason}")
+            if self.port.tick_count % CONFIG["log_every_n_ticks"] == 0:
+                print(f"[RISK] [BLOCKED] {reason}")
             return
 
         # ⑥ Execute via Smart Order Router (SOR)
         depths = get_simulated_depths(price)
         if signal == "BUY":
-            result = self.engine.smart_route_order("BUY", SYMBOL, order_qty, depths)
+            result = self.engine.smart_route_order("BUY", CONFIG["symbol"], order_qty, depths)
             exec_price = result["average_price"]
             cost       = result["cost"]
             if self.port.capital >= cost:
                 self.port.capital  -= cost
                 self.port.position += order_qty
         else:  # SELL
-            result = self.engine.smart_route_order("SELL", SYMBOL, order_qty, depths)
+            result = self.engine.smart_route_order("SELL", CONFIG["symbol"], order_qty, depths)
             exec_price = result["average_price"]
             proceeds   = result["cost"]
             self.port.capital  += proceeds
@@ -196,17 +217,26 @@ class HFTSovereignDaemon:
         self.port.record_trade(signal, order_qty, exec_price, result["latency_us"])
         self.port.pnl_series.append(self.port.value(price))
 
-        print(f"   ✅ [{signal:4s}] {order_qty:.4f} BTC @ ${exec_price:,.2f} | "
+        print(f"   [EXEC] [{signal:4s}] {order_qty:.4f} BTC @ ${exec_price:,.2f} | "
               f"Equity: ${self.port.value(price):,.2f} | OBI: {obi:+.3f}")
 
+    def _shutdown_handler(self, sig, frame):
+        print(f"\n[DAEMON] Signal {sig} received — shutting down...")
+        self.running = False
+
     # ── Main loop ────────────────────────────────────────────────────────────
-    def run(self, duration_sec=MAX_RUNTIME_SEC):
+    def run(self):
+        duration_sec = CONFIG["max_runtime_sec"]
         self.running = True
+
+        signal.signal(signal.SIGINT, self._shutdown_handler)
+        signal.signal(signal.SIGTERM, self._shutdown_handler)
+
         start = time.time()
-        print(f"\n   Mode    : {'LIVE 🔴' if LIVE_MODE else 'PAPER 🟡'}")
-        print(f"   Symbol  : {SYMBOL}")
-        print(f"   Capital : ${INITIAL_CAPITAL:,.2f}")
-        print(f"   Runtime : {duration_sec}s\n")
+        print(f"\n   Mode    : {CONFIG['mode'].upper()}")
+        print(f"   Symbol  : {CONFIG['symbol']}")
+        print(f"   Capital : ${CONFIG['initial_capital']:,.2f}")
+        print(f"   Runtime : {'Infinite' if duration_sec == 0 else f'{duration_sec}s'}\n")
 
         try:
             while self.running:
@@ -214,9 +244,9 @@ class HFTSovereignDaemon:
                 elapsed = time.time() - start
                 if duration_sec > 0 and elapsed >= duration_sec:
                     break
-                time.sleep(TICK_INTERVAL_MS / 1000.0)
+                time.sleep(CONFIG["tick_interval_ms"] / 1000.0)
         except KeyboardInterrupt:
-            print("\n[DAEMON] KeyboardInterrupt received — shutting down...")
+            pass
         finally:
             self.running = False
             self.port.print_summary(self._price)
